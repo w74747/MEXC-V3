@@ -4,28 +4,35 @@ import requests
 import psycopg2
 import ccxt
 
-# ==================== الإعدادات والمتغيرات البيئية ====================
-API_KEY = os.getenv("MEXC_API_KEY")
-API_SECRET = os.getenv("MEXC_API_SECRET")
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_URL = os.getenv("DATABASE_URL")
+# ==================== استدعاء المتغيرات بنفس الأسماء المعتمدة ====================
+API_KEY = os.getenv("MEXC_API_KEY", "").strip()
+API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DB_URL = os.getenv("DATABASE_URL", "").strip()
 
-# تهيئة المنصة (تداول فوري بدون رافعة)
+# ==================== تهيئة المنصة ====================
 exchange = ccxt.mexc({
     'apiKey': API_KEY,
     'secret': API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
+    'options': {
+        'defaultType': 'spot',
+        'createMarketBuyOrderRequiresPrice': False
+    }
 })
+
+# تأكيد تعيين المفاتيح للكائن مباشرة
+exchange.apiKey = API_KEY
+exchange.secret = API_SECRET
 
 SYMBOL = 'SOL/USDT'
 BASE_COIN = 'SOL'
 QUOTE_COIN = 'USDT'
 
-MAX_OPEN_POSITIONS = 4        # أقصى عدد صفقات مفتوحة في نفس الوقت
-POSITION_PERCENTAGE = 0.25    # دخول بـ 25% من إجمالي المحفظة لكل صفقة
-TAKE_PROFIT_RATIO = 0.01      # هدف جني ربح 1.0%
+MAX_OPEN_POSITIONS = 4        # أقصى عدد صفقات مفتوحة معاً
+POSITION_PERCENTAGE = 0.25    # 25% من إجمالي المحفظة لكل صفقة
+TAKE_PROFIT_RATIO = 0.01      # هدف ربح 1.0%
 
 # ==================== إدارة قاعدة البيانات ====================
 def get_db_connection():
@@ -52,7 +59,7 @@ def init_db():
         conn.commit()
 
 def get_open_positions():
-    """استرجاع جميع الصفقات المفتوحة حالياً لمتابعتها"""
+    """استرجاع الصفقات المفتوحة حالياً"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -68,9 +75,10 @@ def get_cumulative_profit():
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(SUM(net_profit_usd), 0.0) FROM trades WHERE status = 'CLOSED';")
-            return float(cur.fetchone()[0])
+            row = cur.fetchone()
+            return float(row[0]) if row else 0.0
 
-# ==================== نظام الإشعارات ====================
+# ==================== تيليجرام ====================
 def send_telegram(message: str):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -81,37 +89,46 @@ def send_telegram(message: str):
     except Exception as err:
         print(f"خطأ تيليجرام: {err}")
 
-# ==================== دورة التداول الأساسية ====================
+# ==================== دورة التشغيل ====================
 def run_bot():
+    if not API_KEY or not API_SECRET:
+        print("خطأ فادح: لم يتم العثور على MEXC_API_KEY أو MEXC_API_SECRET في البيئة.")
+        return
+
     init_db()
     send_telegram(
         f"🚀 *تم تشغيل البوت بنجاح على منصة MEXC*\n"
         f"• النظام: `Spot Scalping 1:1`\n"
         f"• الزوج: `{SYMBOL}`\n"
-        f"• توزيع رأس المال: `25% لكل صفقة (حد أقصى 4 صفقات)`\n"
+        f"• التوزيع: `25% لكل صفقة (حد أقصى 4 صفقات)`\n"
         f"• الهدف: `1.0% لكل صفقة`"
     )
 
     while True:
         try:
+            # 1. جلب السعر اللحظي
             ticker = exchange.fetch_ticker(SYMBOL)
             current_price = float(ticker['last'])
-            
+
+            # 2. جلب الرصيد
             balance = exchange.fetch_balance()
             usdt_free = float(balance['free'].get(QUOTE_COIN, 0.0))
-            total_equity = float(balance['total'].get(QUOTE_COIN, 0.0)) + (float(balance['total'].get(BASE_COIN, 0.0)) * current_price)
+            usdt_total = float(balance['total'].get(QUOTE_COIN, 0.0))
+            sol_total = float(balance['total'].get(BASE_COIN, 0.0))
+            total_equity = usdt_total + (sol_total * current_price)
 
+            # 3. الصفقات المفتوحة
             open_positions = get_open_positions()
             current_open_count = len(open_positions)
 
-            # 1. فحص إمكانية فتح صفقة جديدة (أقل من 4 مراكز وتوفر كاش كافٍ)
+            # 4. فحص شروط الشراء (أقل من 4 صفقات، وتوفر رصيد كافٍ)
             trade_size_usd = total_equity * POSITION_PERCENTAGE
             if current_open_count < MAX_OPEN_POSITIONS and usdt_free >= trade_size_usd and trade_size_usd >= 10.0:
-                # التأكد من عدم الشراء عند نفس سعر آخر صفقة مباشرة (شرط فارق 0.5% على الأقل لتفادي التكرار اللحظي)
                 can_buy = True
                 if open_positions:
                     last_buy = open_positions[-1]['buy_price']
-                    if abs(current_price - last_buy) / last_buy < 0.005:
+                    # منع التكرار اللحظي عند نفس السعر (اشتراط فارق 0.4% على الأقل)
+                    if abs(current_price - last_buy) / last_buy < 0.004:
                         can_buy = False
 
                 if can_buy:
@@ -131,15 +148,15 @@ def run_bot():
 
                     target_tp = entry_price * (1 + TAKE_PROFIT_RATIO)
                     send_telegram(
-                        f"🟢 *صفقة جديدة (#{trade_id})*\n"
+                        f"🟢 *صفقة شراء جديدة (#{trade_id})*\n"
                         f"• المركز: `{current_open_count + 1}/{MAX_OPEN_POSITIONS}`\n"
                         f"• القيمة: `{actual_cost:.2f}$ (25%)`\n"
                         f"• سعر الدخول: `{entry_price:.2f}$`\n"
-                        f"• هدف البيع: `{target_tp:.2f}$`"
+                        f"• هدف البيع (1%): `{target_tp:.2f}$`"
                     )
                     open_positions = get_open_positions()
 
-            # 2. فحص أهداف جني الأرباح لجميع الصفقات المفتوحة
+            # 5. مراقبة جني الأرباح لكل صفقة مفتوحة
             for pos in open_positions:
                 target_sell_price = pos['buy_price'] * (1 + TAKE_PROFIT_RATIO)
                 if current_price >= target_sell_price:
@@ -165,11 +182,11 @@ def run_bot():
                             conn.commit()
 
                         send_telegram(
-                            f"💰 *تم إغلاق الصفقة (#{pos['id']}) بنجاح!*\n"
+                            f"💰 *تم جني الربح بنجاح للصفقة (#{pos['id']})!*\n"
                             f"• سعر البيع: `{exit_price:.2f}$`\n"
                             f"• صافي الربح: `+{net_profit:.2f} USDT`\n"
                             f"• إجمالي الأرباح التراكمية: `+{new_cumulative:.2f} USDT`\n"
-                            f"• الرصيد الإجمالي التقديري: `{total_equity + net_profit:.2f}$`"
+                            f"• إجمالي قيمة المحفظة: `{(total_equity + net_profit):.2f}$`"
                         )
 
             time.sleep(10)
