@@ -1,5 +1,6 @@
 import os
 import time
+import math
 import requests
 import psycopg2
 import ccxt
@@ -19,10 +20,10 @@ WATCHLIST = [
     'DOT/USDT', 'POL/USDT', 'PEPE/USDT', 'SHIB/USDT'
 ]
 
-MAX_SLOTS = 4
-SLOT_PERCENTAGE = 0.25
-TP_PERCENT = 0.0035
-BOLLINGER_STD = 1.5
+MAX_SLOTS = 4                 # 4 مراكز كحد أقصى متزامن
+SLOT_PERCENTAGE = 0.25        # 25% من إجمالي المحفظة لكل صفقة
+TP_PERCENT = 0.0035           # هدف ربح +0.35% (أمر Limit Maker بصفر عمولة)
+BOLLINGER_STD = 1.5           # حساسية البولنجر السريعة (فريم 1m)
 
 exchange = ccxt.mexc({
     'apiKey': API_KEY,
@@ -36,15 +37,14 @@ exchange = ccxt.mexc({
 exchange.apiKey = API_KEY
 exchange.secret = API_SECRET
 
-# ==================== إدارة وتصحيح قاعدة البيانات ====================
+# ==================== قاعدة البيانات ====================
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
 def init_db():
-    """حذف الجدول القديم وبناء الجدول بالأعمدة الجديدة بشكل كامل وصحيح"""
+    """ضمان تهيئة جدول الصفقات بجميع الأعمدة الصحيحة"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            # إضافة العمود إذا لم يكن موجوداً، أو إعادة بناء الجدول النظيف
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id SERIAL PRIMARY KEY,
@@ -60,15 +60,83 @@ def init_db():
                     closed_at TIMESTAMP
                 );
             """)
-            # التأكد البرمجي من وجود العمود في حال كان الجدول قديماً
-            cur.execute("""
-                ALTER TABLE trades ADD COLUMN IF NOT EXISTS sell_order_id VARCHAR(64);
-            """)
-            # تصفير أي سجلات عالقة لضمان عداد 0/4
-            cur.execute("TRUNCATE TABLE trades RESTART IDENTITY;")
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS sell_order_id VARCHAR(64);")
         conn.commit()
 
-def get_open_trades():
+# ==================== تيليجرام ====================
+def send_telegram(message: str):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as err:
+        print(f"Telegram error: {err}")
+
+# ==================== إدارة الدقة وحساب الكميات ====================
+def apply_step_size(symbol: str, qty: float) -> float:
+    try:
+        mkt = exchange.market(symbol)
+        precision = mkt.get("precision", {}).get("amount", 4)
+        if isinstance(precision, int):
+            factor = 10 ** precision
+            return math.floor(qty * factor) / factor
+        elif isinstance(precision, float) and precision > 0:
+            return math.floor(qty / precision) * precision
+    except Exception:
+        pass
+    return round(qty, 4)
+
+# ==================== مؤشر البولنجر اللحظي (1 دقيقة) ====================
+def get_bollinger_bands(symbol: str, period: int = 20, num_std: float = BOLLINGER_STD):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=period + 5)
+        if len(ohlcv) < period:
+            return None, None, None
+        
+        closes = np.array([c[4] for c in ohlcv[-period:]], dtype=float)
+        sma = float(np.mean(closes))
+        std = float(np.std(closes))
+        lower_band = sma - (num_std * std)
+        current_close = float(closes[-1])
+        return lower_band, sma, current_close
+    except Exception as err:
+        print(f"خطأ قراءة بيانات {symbol}: {err}")
+        return None, None, None
+
+# ==================== نظام Auto-Heal التلقائي ====================
+def auto_heal_portfolio():
+    """مزامنة المحفظة وقاعدة البيانات تلقائياً وتصفير أي أخطاء سابقة"""
+    print("🔧 [Auto-Heal] بدء فحص وتصحيح أوضاع المحفظة...")
+    try:
+        exchange.load_markets()
+        bal = exchange.fetch_balance({'type': 'spot'})
+        
+        # تصفية أي عملات متبقية إلى كاش نقي
+        for symbol in WATCHLIST:
+            base = symbol.split('/')[0]
+            qty = float(bal['free'].get(base, 0.0))
+            if qty > 0:
+                ticker = exchange.fetch_ticker(symbol)
+                cur_price = float(ticker['last'])
+                if (qty * cur_price) > 3.0:
+                    sell_qty = apply_step_size(symbol, qty)
+                    exchange.create_market_sell_order(symbol, sell_qty)
+                    print(f"تمت تصفية {sell_qty} {base} تلقائياً عبر Auto-Heal.")
+
+        # تصفير سجل الصفقات العالقة في قاعدة البيانات لضمان دقة العداد 0/4
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE trades RESTART IDENTITY;")
+            conn.commit()
+
+        send_telegram("🔧 *Auto-Heal: تم تنظيف الحساب وتصفير السجلات بنجاح.*\nالنظام كاش 100% USDT وجاهز للمسح اللحظي.")
+    except Exception as e:
+        print(f"خطأ أثناء Auto-Heal: {e}")
+
+# ==================== إدارة الصفقات المفتوحة ====================
+def fetch_active_trades():
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -83,78 +151,34 @@ def get_open_trades():
                 "buy_price": float(r[3]), "qty": float(r[4]), "cost": float(r[5])
             } for r in rows]
 
-# ==================== تيليجرام ====================
-def send_telegram(message: str):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as err:
-        print(f"Telegram error: {err}")
-
-# ==================== حساب مؤشر Bollinger Bands ====================
-def get_bollinger_bands(symbol: str, period: int = 20, num_std: float = BOLLINGER_STD):
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=period + 5)
-        if len(ohlcv) < period:
-            return None, None, None
-        
-        closes = np.array([c[4] for c in ohlcv[-period:]], dtype=float)
-        sma = float(np.mean(closes))
-        std = float(np.std(closes))
-        lower_band = sma - (num_std * std)
-        current_close = float(closes[-1])
-        return lower_band, sma, current_close
-    except Exception as err:
-        print(f"خطأ قراءة شارت {symbol}: {err}")
-        return None, None, None
-
-# ==================== تصفية البداية ====================
-def clean_start_flush():
-    try:
-        balance = exchange.fetch_balance()
-        for symbol in WATCHLIST:
-            base = symbol.split('/')[0]
-            qty = float(balance['free'].get(base, 0.0))
-            if qty > 0:
-                ticker = exchange.fetch_ticker(symbol)
-                cur_price = float(ticker['last'])
-                if (qty * cur_price) > 5.0:
-                    exchange.create_market_sell_order(symbol, qty)
-                    print(f"تمت تصفية {qty} {base}")
-
-        send_telegram("✅ *تم إصلاح هيكل قاعدة البيانات وتجهيز الرصيد كاش 100% USDT.*\nبدء مسح الـ 16 زوجاً للشراء الفوري.")
-    except Exception as err:
-        print(f"تنبيه التصفية: {err}")
-
 # ==================== محرك التداول الأساسي ====================
 def run_bot():
     if not API_KEY or not API_SECRET:
-        print("خطأ: مفاتيح المنصة غير معرفة.")
+        print("خطأ: مفاتيح المنصة مفقودة.")
         return
 
     init_db()
-    clean_start_flush()
+    auto_heal_portfolio()
 
     send_telegram(
-        f"⚡ *تم تفعيل ماسح الـ 16 زوجاً بنجاح*\n"
-        f"• حساسية البولنجر: `Std {BOLLINGER_STD} (فريم 1 دقيقة)`\n"
-        f"• المراكز: `حتى 4 عملات متزامنة (25% لكل مركز)`\n"
-        f"• الهدف: `أمر بيع Limit معلق (+0.35% بصفر رسوم صانع)`"
+        f"⚡ *تم إطلاق محرك Scalping Engine v3 المتطور*\n"
+        f"• العملات المراقبة: `16 زوجاً نشطاً (Spot 1:1)`\n"
+        f"• أقصى عدد مراكز: `4 مراكز متزامنة (25% لكل مركز)`\n"
+        f"• فلتر الدخول: `كسر بولنجر الدقيقة (Std 1.5)`\n"
+        f"• نوع أمر الخروج: `Maker Limit (+0.35% بصفر عمولة)`"
     )
 
     while True:
         try:
-            balance = exchange.fetch_balance()
-            usdt_free = float(balance['free'].get('USDT', 0.0))
-            total_equity = float(balance['total'].get('USDT', 0.0))
+            bal = exchange.fetch_balance({'type': 'spot'})
+            usdt_free = float(bal['free'].get('USDT', 0.0))
+            total_equity = float(bal['total'].get('USDT', 0.0))
 
-            open_trades = get_open_trades()
+            open_trades = fetch_active_trades()
+            active_symbols = [t['symbol'] for t in open_trades]
             trade_size_usd = total_equity * SLOT_PERCENTAGE
 
-            # 1. متابعة تنفيذ أوامر البيع المعلقة
+            # 1. متابعة أوامر البيع Limit في دفتر الأوامر
             for t in open_trades:
                 sym = t['symbol']
                 sell_id = t['sell_order_id']
@@ -162,9 +186,9 @@ def run_bot():
 
                 if sell_id:
                     try:
-                        order_info = exchange.fetch_order(sell_id, sym)
-                        if order_info['status'] == 'closed':
-                            sold_price = float(order_info.get('average') or (t['buy_price'] * (1 + TP_PERCENT)))
+                        order = exchange.fetch_order(sell_id, sym)
+                        if order['status'] == 'closed':
+                            sold_price = float(order.get('average') or (t['buy_price'] * (1 + TP_PERCENT)))
                             profit = (sold_price - t['buy_price']) * t['qty']
 
                             with get_db_connection() as conn:
@@ -177,16 +201,16 @@ def run_bot():
                                 conn.commit()
 
                             send_telegram(
-                                f"🎯 *تم تنفيذ هدف الربح بنجاح! (#{t_id})*\n"
-                                f"• الزوج: `{sym}`\n"
+                                f"🎯 *تم جني الربح بنجاح! (#{t_id})*\n"
+                                f"• العملة: `{sym}`\n"
                                 f"• سعر البيع: `{sold_price:.4f}$`\n"
-                                f"• صافي الربح: `+{profit:.2f} USDT` (0% رسوم صانع)"
+                                f"• الربح الصافي: `+{profit:.2f} USDT` (0% رسوم صانع)"
                             )
                     except Exception:
                         pass
 
-            # 2. مسح الـ 16 زوجاً واقتناص الدخول
-            open_trades = get_open_trades()
+            # 2. فحص سلة الـ 16 زوجاً واقتناص الصفقات الجديدة
+            open_trades = fetch_active_trades()
             active_symbols = [t['symbol'] for t in open_trades]
 
             if len(open_trades) < MAX_SLOTS and usdt_free >= trade_size_usd and trade_size_usd >= 15.0:
@@ -200,26 +224,25 @@ def run_bot():
                     if not lower_band:
                         continue
 
-                    # شرط الدخول الإحصائي
+                    # شرط الدخول: شمعة الدقيقة كسرت أو عادلت الحد السفلي
                     if cur_close <= lower_band:
                         base = symbol.split('/')[0]
-                        amount_to_buy = trade_size_usd / cur_close
-                        amount_to_buy = float(exchange.amount_to_precision(symbol, amount_to_buy))
+                        amount_to_buy = apply_step_size(symbol, trade_size_usd / cur_close)
 
-                        # تنفيذ الشراء المباشر
+                        # تنفيذ الشراء الفوري
                         buy_order = exchange.create_market_buy_order(symbol, amount_to_buy)
                         entry_price = float(buy_order.get('average') or cur_close)
                         actual_cost = entry_price * amount_to_buy
 
-                        # تعليق أمر البيع Limit كصانع سوق بصفر رسوم
+                        # حساب سعر البيع Limit مع ضبط الدقة
                         sell_target_price = entry_price * (1 + TP_PERCENT)
                         sell_target_price = float(exchange.price_to_precision(symbol, sell_target_price))
 
-                        time.sleep(0.4)
+                        time.sleep(0.3)
                         base_bal = float(exchange.fetch_balance()['free'].get(base, 0.0))
-                        actual_sell_qty = min(amount_to_buy, base_bal)
-                        actual_sell_qty = float(exchange.amount_to_precision(symbol, actual_sell_qty))
+                        actual_sell_qty = apply_step_size(symbol, min(amount_to_buy, base_bal))
 
+                        # تعليق أمر البيع كصانع سوق معفى من الرسوم
                         sell_order = exchange.create_limit_sell_order(symbol, actual_sell_qty, sell_target_price)
                         sell_order_id = sell_order['id']
 
@@ -242,11 +265,11 @@ def run_bot():
                         )
                         break
 
-            time.sleep(5)
+            time.sleep(4)
 
         except Exception as loop_err:
-            print(f"خطأ في الدورة: {loop_err}")
-            time.sleep(7)
+            print(f"خطأ الدورة: {loop_err}")
+            time.sleep(6)
 
 if __name__ == "__main__":
     run_bot()
