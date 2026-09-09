@@ -23,7 +23,7 @@ WATCHLIST = [
 MAX_SLOTS = 4                 # 4 مراكز كحد أقصى متزامن
 SLOT_PERCENTAGE = 0.25        # 25% من إجمالي المحفظة لكل صفقة
 TP_PERCENT = 0.0035           # هدف ربح +0.35% (أمر Limit Maker بصفر عمولة)
-BOLLINGER_STD = 1.5           # حساسية البولنجر السريعة (فريم 1m)
+BOLLINGER_STD = 1.5           # حساسية البولنجر اللحظية (فريم 1m)
 
 exchange = ccxt.mexc({
     'apiKey': API_KEY,
@@ -42,7 +42,6 @@ def get_db_connection():
     return psycopg2.connect(DB_URL)
 
 def init_db():
-    """ضمان تهيئة جدول الصفقات بجميع الأعمدة الصحيحة"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -51,9 +50,9 @@ def init_db():
                     symbol VARCHAR(20) NOT NULL,
                     status VARCHAR(20) DEFAULT 'OPEN',
                     sell_order_id VARCHAR(64),
-                    buy_price NUMERIC(14, 4) NOT NULL,
-                    sell_price NUMERIC(14, 4),
-                    quantity NUMERIC(14, 4) NOT NULL,
+                    buy_price NUMERIC(18, 8) NOT NULL,
+                    sell_price NUMERIC(18, 8),
+                    quantity NUMERIC(18, 8) NOT NULL,
                     cost_usd NUMERIC(14, 4) NOT NULL,
                     net_profit_usd NUMERIC(14, 4) DEFAULT 0.0,
                     opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -107,13 +106,11 @@ def get_bollinger_bands(symbol: str, period: int = 20, num_std: float = BOLLINGE
 
 # ==================== نظام Auto-Heal التلقائي ====================
 def auto_heal_portfolio():
-    """مزامنة المحفظة وقاعدة البيانات تلقائياً وتصفير أي أخطاء سابقة"""
     print("🔧 [Auto-Heal] بدء فحص وتصحيح أوضاع المحفظة...")
     try:
         exchange.load_markets()
         bal = exchange.fetch_balance({'type': 'spot'})
         
-        # تصفية أي عملات متبقية إلى كاش نقي
         for symbol in WATCHLIST:
             base = symbol.split('/')[0]
             qty = float(bal['free'].get(base, 0.0))
@@ -125,13 +122,12 @@ def auto_heal_portfolio():
                     exchange.create_market_sell_order(symbol, sell_qty)
                     print(f"تمت تصفية {sell_qty} {base} تلقائياً عبر Auto-Heal.")
 
-        # تصفير سجل الصفقات العالقة في قاعدة البيانات لضمان دقة العداد 0/4
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("TRUNCATE TABLE trades RESTART IDENTITY;")
             conn.commit()
 
-        send_telegram("🔧 *Auto-Heal: تم تنظيف الحساب وتصفير السجلات بنجاح.*\nالنظام كاش 100% USDT وجاهز للمسح اللحظي.")
+        send_telegram("🔧 *Auto-Heal: تم تنظيف الحساب وتصفير السجلات بنجاح.*\nالمحفظة كاش 100% USDT وجاهزة للشراء اللحظي.")
     except Exception as e:
         print(f"خطأ أثناء Auto-Heal: {e}")
 
@@ -161,11 +157,11 @@ def run_bot():
     auto_heal_portfolio()
 
     send_telegram(
-        f"⚡ *تم إطلاق محرك Scalping Engine v3 المتطور*\n"
+        f"⚡ *تم إطلاق محرك Scalping Engine v3 المحدث*\n"
         f"• العملات المراقبة: `16 زوجاً نشطاً (Spot 1:1)`\n"
-        f"• أقصى عدد مراكز: `4 مراكز متزامنة (25% لكل مركز)`\n"
-        f"• فلتر الدخول: `كسر بولنجر الدقيقة (Std 1.5)`\n"
-        f"• نوع أمر الخروج: `Maker Limit (+0.35% بصفر عمولة)`"
+        f"• أقصى عدد مراكز: `4 مراكز متزامنة (عملة مختلفة لكل مركز)`\n"
+        f"• الدخول: `كسر بولنجر الدقيقة (Std 1.5)`\n"
+        f"• الخروج: `Maker Limit (+0.35% بصفر عمولة)`"
     )
 
     while True:
@@ -203,7 +199,7 @@ def run_bot():
                             send_telegram(
                                 f"🎯 *تم جني الربح بنجاح! (#{t_id})*\n"
                                 f"• العملة: `{sym}`\n"
-                                f"• سعر البيع: `{sold_price:.4f}$`\n"
+                                f"• سعر البيع: `{sold_price:.8g}$`\n"
                                 f"• الربح الصافي: `+{profit:.2f} USDT` (0% رسوم صانع)"
                             )
                     except Exception:
@@ -215,6 +211,7 @@ def run_bot():
 
             if len(open_trades) < MAX_SLOTS and usdt_free >= trade_size_usd and trade_size_usd >= 15.0:
                 for symbol in WATCHLIST:
+                    # منع الدخول إذا كانت العملة مفتوحة بالفعل
                     if symbol in active_symbols:
                         continue
 
@@ -228,6 +225,9 @@ def run_bot():
                     if cur_close <= lower_band:
                         base = symbol.split('/')[0]
                         amount_to_buy = apply_step_size(symbol, trade_size_usd / cur_close)
+
+                        # حجز العملة فوراً في القائمة المحلية لمنع التكرار في نفس الدورة
+                        active_symbols.append(symbol)
 
                         # تنفيذ الشراء الفوري
                         buy_order = exchange.create_market_buy_order(symbol, amount_to_buy)
@@ -255,11 +255,12 @@ def run_bot():
                                 t_new_id = cur.fetchone()[0]
                             conn.commit()
 
+                        # تنسيق .8g لعرض أرقام عملات الميم بدقة كاملة
                         send_telegram(
                             f"🟢 *صفقة سكالبينج جديدة (#{t_new_id})*\n"
                             f"• الزوج: `{symbol}`\n"
-                            f"• سعر الدخول: `{entry_price:.4f}$`\n"
-                            f"• أمر البيع المعلق (Limit): `{sell_target_price:.4f}$` (+0.35%)\n"
+                            f"• سعر الدخول: `{entry_price:.8g}$`\n"
+                            f"• أمر البيع المعلق (Limit): `{sell_target_price:.8g}$` (+0.35%)\n"
                             f"• القيمة: `{actual_cost:.2f}$ (25%)`\n"
                             f"• الرسوم: `0% Maker Fee`"
                         )
