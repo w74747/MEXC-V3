@@ -12,7 +12,6 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DB_URL = os.getenv("DATABASE_URL", "").strip()
 
-# سلة الـ 16 زوجاً النشطة وعالية السيولة
 WATCHLIST = [
     'SOL/USDT', 'ETH/USDT', 'DOGE/USDT', 'NEAR/USDT', 
     'AVAX/USDT', 'SUI/USDT', 'LINK/USDT', 'XRP/USDT', 
@@ -20,10 +19,10 @@ WATCHLIST = [
     'DOT/USDT', 'POL/USDT', 'PEPE/USDT', 'SHIB/USDT'
 ]
 
-MAX_SLOTS = 4                 # 4 صفقات متزامنة كحد أقصى (عملة مختلفة لكل مركز)
-SLOT_PERCENTAGE = 0.25        # 25% من إجمالي المحفظة لكل صفقة
-TP_PERCENT = 0.0035           # هدف ربح لحظي +0.35% (أمر Limit Maker بصفر رسوم)
-BOLLINGER_STD = 1.5           # حساسية البولنجر اللحظية (فريم 1 دقيقة)
+MAX_SLOTS = 4
+SLOT_PERCENTAGE = 0.25
+TP_PERCENT = 0.0035
+BOLLINGER_STD = 1.5
 
 exchange = ccxt.mexc({
     'apiKey': API_KEY,
@@ -37,13 +36,15 @@ exchange = ccxt.mexc({
 exchange.apiKey = API_KEY
 exchange.secret = API_SECRET
 
-# ==================== إدارة قاعدة البيانات ====================
+# ==================== إدارة وتصحيح قاعدة البيانات ====================
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
 def init_db():
+    """حذف الجدول القديم وبناء الجدول بالأعمدة الجديدة بشكل كامل وصحيح"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            # إضافة العمود إذا لم يكن موجوداً، أو إعادة بناء الجدول النظيف
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id SERIAL PRIMARY KEY,
@@ -59,6 +60,12 @@ def init_db():
                     closed_at TIMESTAMP
                 );
             """)
+            # التأكد البرمجي من وجود العمود في حال كان الجدول قديماً
+            cur.execute("""
+                ALTER TABLE trades ADD COLUMN IF NOT EXISTS sell_order_id VARCHAR(64);
+            """)
+            # تصفير أي سجلات عالقة لضمان عداد 0/4
+            cur.execute("TRUNCATE TABLE trades RESTART IDENTITY;")
         conn.commit()
 
 def get_open_trades():
@@ -101,10 +108,10 @@ def get_bollinger_bands(symbol: str, period: int = 20, num_std: float = BOLLINGE
         current_close = float(closes[-1])
         return lower_band, sma, current_close
     except Exception as err:
-        print(f"خطأ بيانات {symbol}: {err}")
+        print(f"خطأ قراءة شارت {symbol}: {err}")
         return None, None, None
 
-# ==================== تصفية البداية وتصفير قاعدة البيانات ====================
+# ==================== تصفية البداية ====================
 def clean_start_flush():
     try:
         balance = exchange.fetch_balance()
@@ -118,15 +125,9 @@ def clean_start_flush():
                     exchange.create_market_sell_order(symbol, qty)
                     print(f"تمت تصفية {qty} {base}")
 
-        # تصفير جدول الصفقات بالكامل ليعود العداد 0/4
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("TRUNCATE TABLE trades RESTART IDENTITY;")
-            conn.commit()
-
-        send_telegram("🧹 *تم تصفير سجل الصفقات بالكامل (0/4 مراكز)*\nالمحفظة كاش 100% USDT وجاهزة للشراء اللحظي.")
+        send_telegram("✅ *تم إصلاح هيكل قاعدة البيانات وتجهيز الرصيد كاش 100% USDT.*\nبدء مسح الـ 16 زوجاً للشراء الفوري.")
     except Exception as err:
-        print(f"تنبيه أثناء التصفية المبدئية: {err}")
+        print(f"تنبيه التصفية: {err}")
 
 # ==================== محرك التداول الأساسي ====================
 def run_bot():
@@ -138,10 +139,10 @@ def run_bot():
     clean_start_flush()
 
     send_telegram(
-        f"⚡ *تم تفعيل ماسح الـ 16 زوجاً (Spot 1:1)*\n"
+        f"⚡ *تم تفعيل ماسح الـ 16 زوجاً بنجاح*\n"
         f"• حساسية البولنجر: `Std {BOLLINGER_STD} (فريم 1 دقيقة)`\n"
-        f"• الحد الأقصى للمراكز: `4 عملات متزامنة (25% لكل مركز)`\n"
-        f"• الخروج: `أمر بيع معلق Limit (+0.35% بصفر رسوم صانع)`"
+        f"• المراكز: `حتى 4 عملات متزامنة (25% لكل مركز)`\n"
+        f"• الهدف: `أمر بيع Limit معلق (+0.35% بصفر رسوم صانع)`"
     )
 
     while True:
@@ -153,7 +154,7 @@ def run_bot():
             open_trades = get_open_trades()
             trade_size_usd = total_equity * SLOT_PERCENTAGE
 
-            # 1. متابعة أوامر البيع Limit المعلقة في دفتر الأوامر
+            # 1. متابعة تنفيذ أوامر البيع المعلقة
             for t in open_trades:
                 sym = t['symbol']
                 sell_id = t['sell_order_id']
@@ -184,7 +185,7 @@ def run_bot():
                     except Exception:
                         pass
 
-            # 2. مسح سلة الـ 16 زوجاً لاقتناص كسر البولنجر السفلي
+            # 2. مسح الـ 16 زوجاً واقتناص الدخول
             open_trades = get_open_trades()
             active_symbols = [t['symbol'] for t in open_trades]
 
@@ -194,12 +195,12 @@ def run_bot():
                         continue
 
                     lower_band, sma, cur_close = get_bollinger_bands(symbol)
-                    time.sleep(0.08)  # حماية حد الطلبات للمنصة
+                    time.sleep(0.08)
 
                     if not lower_band:
                         continue
 
-                    # شرط الدخول: السعر عند أو أدنى من الحد السفلي للبولنجر
+                    # شرط الدخول الإحصائي
                     if cur_close <= lower_band:
                         base = symbol.split('/')[0]
                         amount_to_buy = trade_size_usd / cur_close
@@ -210,7 +211,7 @@ def run_bot():
                         entry_price = float(buy_order.get('average') or cur_close)
                         actual_cost = entry_price * amount_to_buy
 
-                        # حساب سعر هدف البيع Limit
+                        # تعليق أمر البيع Limit كصانع سوق بصفر رسوم
                         sell_target_price = entry_price * (1 + TP_PERCENT)
                         sell_target_price = float(exchange.price_to_precision(symbol, sell_target_price))
 
@@ -219,7 +220,6 @@ def run_bot():
                         actual_sell_qty = min(amount_to_buy, base_bal)
                         actual_sell_qty = float(exchange.amount_to_precision(symbol, actual_sell_qty))
 
-                        # تعليق أمر البيع Limit كصانع سوق بصفر رسوم
                         sell_order = exchange.create_limit_sell_order(symbol, actual_sell_qty, sell_target_price)
                         sell_order_id = sell_order['id']
 
