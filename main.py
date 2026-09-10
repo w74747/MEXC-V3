@@ -20,10 +20,11 @@ WATCHLIST = [
     'DOT/USDT', 'POL/USDT', 'PEPE/USDT', 'SHIB/USDT'
 ]
 
-MAX_SLOTS = 4                 # أقصى عدد صفقات متزامنة
-FIXED_TRADE_USD = 200.0       # 200$ ثابتة لكل صفقة
-TP_PERCENT = 0.0035           # هدف ربح لحظي +0.35% (أمر Limit صانع بصفر رسوم)
-BOLLINGER_STD = 1.5           # حساسية البولنجر (فريم 1 دقيقة)
+MAX_SLOTS = 8                 # زيادة السعة إلى 8 مراكز لتفادي تجمد السيولة
+FIXED_TRADE_USD = 100.0       # 100$ ثابتة لكل مركز
+TP_PERCENT = 0.0035           # هدف ربح +0.35% (أمر Limit صانع بصفر رسوم)
+TAKER_FEE_RATE = 0.001        # عمولة الشراء بسعر السوق (0.1% Taker)
+BOLLINGER_STD = 1.5           # حساسية البولنجر اللحظية (فريم 1 دقيقة)
 
 exchange = ccxt.mexc({
     'apiKey': API_KEY,
@@ -37,7 +38,7 @@ exchange = ccxt.mexc({
 exchange.apiKey = API_KEY
 exchange.secret = API_SECRET
 
-# ==================== قاعدة البيانات ====================
+# ==================== إدارة قاعدة البيانات ====================
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
@@ -62,6 +63,20 @@ def init_db():
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS sell_order_id VARCHAR(64);")
         conn.commit()
 
+def get_cumulative_profit() -> float:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COALESCE(SUM(net_profit_usd), 0.0) 
+                    FROM trades 
+                    WHERE status = 'CLOSED';
+                """)
+                total = cur.fetchone()[0]
+                return float(total)
+    except Exception:
+        return 0.0
+
 # ==================== تيليجرام ====================
 def send_telegram(message: str):
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -73,7 +88,7 @@ def send_telegram(message: str):
     except Exception as err:
         print(f"Telegram error: {err}")
 
-# ==================== معالجة الدقة للأحجام ====================
+# ==================== إدارة دقة الأحجام ====================
 def apply_step_size(symbol: str, qty: float) -> float:
     try:
         mkt = exchange.market(symbol)
@@ -87,7 +102,7 @@ def apply_step_size(symbol: str, qty: float) -> float:
         pass
     return round(qty, 4)
 
-# ==================== مؤشر البولنجر باند ====================
+# ==================== مؤشر البولنجر اللحظي ====================
 def get_bollinger_bands(symbol: str, period: int = 20, num_std: float = BOLLINGER_STD):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=period + 5)
@@ -101,53 +116,8 @@ def get_bollinger_bands(symbol: str, period: int = 20, num_std: float = BOLLINGE
         current_close = float(closes[-1])
         return lower_band, sma, current_close
     except Exception as err:
-        print(f"خطأ شمعة {symbol}: {err}")
+        print(f"خطأ بيانات {symbol}: {err}")
         return None, None, None
-
-# ==================== تحرير الأوامر المعلقة وإعادة الضبط الكاش ====================
-def reset_to_cash():
-    print("🧹 [Auto-Reset] بدء إلغاء الأوامر وتسييل المحفظة كاش 100% USDT...")
-    try:
-        exchange.load_markets()
-
-        # 1. إلغاء أي أوامر معلقة لتحرير الأرصدة المقفلة
-        for symbol in WATCHLIST:
-            try:
-                open_orders = exchange.fetch_open_orders(symbol)
-                for order in open_orders:
-                    exchange.cancel_order(order['id'], symbol)
-                    print(f"تم إلغاء الأمر المعلق {order['id']} على {symbol}")
-            except Exception:
-                pass
-
-        time.sleep(1)
-
-        # 2. تصفية الأرصدة المحررة إلى USDT
-        bal = exchange.fetch_balance({'type': 'spot'})
-        for symbol in WATCHLIST:
-            base = symbol.split('/')[0]
-            qty = float(bal['free'].get(base, 0.0))
-            if qty > 0:
-                ticker = exchange.fetch_ticker(symbol)
-                cur_price = float(ticker['last'])
-                if (qty * cur_price) > 2.0:
-                    sell_qty = apply_step_size(symbol, qty)
-                    exchange.create_market_sell_order(symbol, sell_qty)
-                    print(f"تمت تصفية {sell_qty} {base}")
-
-        # 3. تصفير قاعدة البيانات لبدء عداد جديد 0/4
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("TRUNCATE TABLE trades RESTART IDENTITY;")
-            conn.commit()
-
-        send_telegram(
-            "🧹 *تم إلغاء جميع الأوامر المعلقة وتسييل المحفظة بالكامل كاش 100% USDT.*\n"
-            f"• قيمة الصفقة الموحدة: `{FIXED_TRADE_USD}$`\n"
-            "• النظام جاهز لمسح الـ 16 زوجاً واقتناص 4 مراكز غير مكررة."
-        )
-    except Exception as err:
-        print(f"خطأ أثناء التهيئة: {err}")
 
 # ==================== استعلام الصفقات النشطة ====================
 def fetch_active_trades():
@@ -168,11 +138,18 @@ def fetch_active_trades():
 # ==================== محرك التداول الأساسي ====================
 def run_bot():
     if not API_KEY or not API_SECRET:
-        print("خطأ: مفاتيح المنصة غير موجودة.")
+        print("خطأ: مفاتيح المنصة مفقودة.")
         return
 
     init_db()
-    reset_to_cash()
+
+    send_telegram(
+        f"⚡ *تم تحديث إعدادات التداول والسيولة*\n"
+        f"• قيمة المركز الجديد: `100.0$ ثابتة`\n"
+        f"• السعة القصوى: `8 مراكز متزامنة`\n"
+        f"• شرط الخروج: `+0.35% Maker Limit`\n"
+        f"• استئناف المسح اللحظي بالسيولة المتاحة فوراً."
+    )
 
     while True:
         try:
@@ -181,7 +158,7 @@ def run_bot():
 
             open_trades = fetch_active_trades()
 
-            # 1. متابعة تنفيذ أوامر البيع المعلقة (Limit TP)
+            # 1. متابعة أوامر البيع Limit في دفتر الأوامر
             for t in open_trades:
                 sym = t['symbol']
                 sell_id = t['sell_order_id']
@@ -192,7 +169,10 @@ def run_bot():
                         order = exchange.fetch_order(sell_id, sym)
                         if order['status'] == 'closed':
                             sold_price = float(order.get('average') or (t['buy_price'] * (1 + TP_PERCENT)))
-                            profit = (sold_price - t['buy_price']) * t['qty']
+                            
+                            gross_profit = t['cost'] * TP_PERCENT
+                            entry_fee = t['cost'] * TAKER_FEE_RATE
+                            net_profit = gross_profit - entry_fee
 
                             with get_db_connection() as conn:
                                 with conn.cursor() as cur:
@@ -200,19 +180,23 @@ def run_bot():
                                         UPDATE trades 
                                         SET status = 'CLOSED', sell_price = %s, net_profit_usd = %s, closed_at = CURRENT_TIMESTAMP
                                         WHERE id = %s;
-                                    """, (sold_price, profit, t_id))
+                                    """, (sold_price, net_profit, t_id))
                                 conn.commit()
+
+                            total_accumulated = get_cumulative_profit()
 
                             send_telegram(
                                 f"🎯 *تم جني الربح بنجاح! (#{t_id})*\n"
                                 f"• العملة: `{sym}`\n"
                                 f"• سعر البيع: `{sold_price:.8g}$`\n"
-                                f"• الربح الصافي: `+{profit:.2f} USDT` (0% رسوم صانع)"
+                                f"• الربح الصافي: `+{net_profit:.2f} USDT`\n"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"💰 *إجمالي الأرباح التراكمية:* `+{total_accumulated:.2f} USDT`"
                             )
                     except Exception:
                         pass
 
-            # 2. التحقق من المراكز الشاغرة وتوفر الكاش
+            # 2. فحص سلة الـ 16 زوجاً للشراء بحجم 100$
             open_trades = fetch_active_trades()
             active_symbols = set(t['symbol'] for t in open_trades)
 
@@ -220,11 +204,10 @@ def run_bot():
                 for symbol in WATCHLIST:
                     base = symbol.split('/')[0]
 
-                    # شرط منع التكرار 1: إذا كانت العملة مسجلة كصفقة مفتوحة
                     if symbol in active_symbols:
                         continue
 
-                    # شرط منع التكرار 2: إذا كان للعملة رصيد حقيقي في المحفظة (> 2$)
+                    # فحص وجود رصيد معلق للعملة في المحفظة (> 2$) لمنع التكرار
                     base_balance = float(bal['total'].get(base, 0.0))
                     ticker = exchange.fetch_ticker(symbol)
                     cur_price = float(ticker['last'])
@@ -237,19 +220,16 @@ def run_bot():
                     if not lower_band:
                         continue
 
-                    # شرط الدخول: السعر عند أو أسفل الحد السفلي للبولنجر
+                    # كسر الحد السفلي للبولنجر
                     if cur_close <= lower_band:
                         amount_to_buy = apply_step_size(symbol, FIXED_TRADE_USD / cur_close)
-
-                        # حجز العملة محلياً لمنع تكرارها فوراً
                         active_symbols.add(symbol)
 
-                        # تنفيذ الشراء المباشر بقيمة 200$
+                        # تنفيذ الشراء المباشر بقيمة 100$
                         buy_order = exchange.create_market_buy_order(symbol, amount_to_buy)
                         entry_price = float(buy_order.get('average') or cur_close)
                         actual_cost = entry_price * amount_to_buy
 
-                        # تعليق أمر البيع Limit بهدف +0.35%
                         sell_target_price = entry_price * (1 + TP_PERCENT)
                         sell_target_price = float(exchange.price_to_precision(symbol, sell_target_price))
 
