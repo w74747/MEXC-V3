@@ -224,9 +224,12 @@ def run_bot():
                 if target_hit:
                     continue
 
-                # وقف الخسارة الصارم أو الزمني
+                # وقف الخسارة الصارم أو الزمني (مع حماية ضد الصفر)
                 hold_duration = (datetime.now() - opened_at).total_seconds()
                 try:
+                    if t['buy_price'] <= 0:
+                        continue
+
                     ticker = exchange.fetch_ticker(sym)
                     cur_price = float(ticker['last'])
                     loss_pct = (cur_price - t['buy_price']) / t['buy_price']
@@ -240,7 +243,8 @@ def run_bot():
                             time.sleep(0.3)
 
                         sell_qty = apply_step_size(sym, t['qty'])
-                        exchange.create_market_sell_order(sym, sell_qty)
+                        if sell_qty > 0:
+                            exchange.create_market_sell_order(sym, sell_qty)
                         actual_loss = (cur_price - t['buy_price']) * sell_qty - (t['cost'] * TAKER_FEE_RATE)
 
                         with get_db_connection() as conn:
@@ -270,7 +274,6 @@ def run_bot():
             active_symbols = set(t['symbol'] for t in open_trades)
             current_allocated_capital = sum(t['cost'] for t in open_trades)
 
-            # شروط الدخول: مراكز شاغرة + عدم تجاوز سقف رأس المال + توفر كاش
             can_enter = (
                 len(open_trades) < MAX_SLOTS and 
                 (current_allocated_capital + FIXED_TRADE_USD) <= MAX_TOTAL_CAPITAL and 
