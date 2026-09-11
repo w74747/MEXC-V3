@@ -21,13 +21,14 @@ WATCHLIST = [
     'DOT/USDT', 'POL/USDT', 'PEPE/USDT', 'SHIB/USDT'
 ]
 
-MAX_SLOTS = 8                 # سعة 8 مراكز متزامنة
+MAX_SLOTS = 5                 # خفض السعة إلى 5 مراكز كحد أقصى لمنع تشتت رأس المال
 FIXED_TRADE_USD = 100.0       # 100$ لكل مركز
-TP_PERCENT = 0.0035           # هدف ربح +0.35% (أمر صانع Maker)
+TP_PERCENT = 0.0055           # رفع الهدف إلى +0.55% لرفع صافي الربح
 TAKER_FEE_RATE = 0.001        # عمولة الشراء (0.1% Taker)
-MAX_HOLD_SECONDS = 3600       # إغلاق زمني إذا تجاوزت الصفقة 60 دقيقة
-TIME_SL_PERCENT = 0.012       # وقف خسارة طارئ -1.2% للمراكز العالقة
-BOLLINGER_STD = 1.5           # حساسية البولنجر اللحظية (1m)
+MAX_HOLD_SECONDS = 1800       # خفض وقت الانتظار إلى 30 دقيقة فقط
+TIGHT_SL_PERCENT = 0.0065     # تضييق وقف الخسارة إلى -0.65% فقط لحماية الرصيد
+COOLDOWN_SECONDS = 1200       # تهدئة 20 دقيقة للعملة بعد إغلاقها
+BOLLINGER_STD = 1.6           # تشديد حساسية القيعان
 
 exchange = ccxt.mexc({
     'apiKey': API_KEY,
@@ -40,6 +41,9 @@ exchange = ccxt.mexc({
 })
 exchange.apiKey = API_KEY
 exchange.secret = API_SECRET
+
+# سجل فترات التهدئة للعملات
+cooldown_tracker = {}
 
 # ==================== إدارة قاعدة البيانات ====================
 def get_db_connection():
@@ -86,7 +90,27 @@ def send_telegram(message: str):
     except Exception as err:
         print(f"Telegram error: {err}")
 
-# ==================== إدارة دقة الأحجام ====================
+# ==================== فحص اتجاه البيتكوين العام ====================
+def is_btc_trend_bullish() -> bool:
+    """منع الشراء إذا كان البيتكوين أسفل متوسط EMA20 على فريم 15 دقيقة"""
+    try:
+        ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=25)
+        if len(ohlcv) < 20:
+            return True
+        closes = [c[4] for c in ohlcv]
+        cur_btc_price = closes[-1]
+        
+        # حساب EMA20
+        weights = np.exp(np.linspace(-1., 0., 20))
+        weights /= weights.sum()
+        ema20 = float(np.convolve(closes[-20:], weights, mode='valid')[0])
+        
+        return cur_btc_price >= ema20
+    except Exception as err:
+        print(f"خطأ فحص البيتكوين: {err}")
+        return True
+
+# ==================== معالجة دقة الأحجام ====================
 def apply_step_size(symbol: str, qty: float) -> float:
     try:
         mkt = exchange.market(symbol)
@@ -100,7 +124,7 @@ def apply_step_size(symbol: str, qty: float) -> float:
         pass
     return round(qty, 4)
 
-# ==================== مؤشر البولنجر ====================
+# ==================== مؤشر البولنجر باند ====================
 def get_bollinger_bands(symbol: str, period: int = 20, num_std: float = BOLLINGER_STD):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=period + 5)
@@ -114,7 +138,7 @@ def get_bollinger_bands(symbol: str, period: int = 20, num_std: float = BOLLINGE
         current_close = float(closes[-1])
         return lower_band, sma, current_close
     except Exception as err:
-        print(f"خطأ مؤشر {symbol}: {err}")
+        print(f"خطأ بيانات {symbol}: {err}")
         return None, None, None
 
 # ==================== استعلام الصفقات النشطة ====================
@@ -134,24 +158,6 @@ def fetch_active_trades():
                 "cost": float(r[5]), "opened_at": r[6]
             } for r in rows]
 
-# ==================== احتساب القيمة الحقيقية للمحفظة ====================
-def calculate_portfolio_equity(usdt_free: float, open_trades: list):
-    unrealized_pnl = 0.0
-    active_assets_val = 0.0
-
-    for t in open_trades:
-        try:
-            ticker = exchange.fetch_ticker(t['symbol'])
-            current_price = float(ticker['last'])
-            current_val = t['qty'] * current_price
-            active_assets_val += current_val
-            unrealized_pnl += (current_val - t['cost'])
-        except Exception:
-            active_assets_val += t['cost']
-
-    total_net_worth = usdt_free + active_assets_val
-    return total_net_worth, unrealized_pnl
-
 # ==================== محرك التداول الأساسي ====================
 def run_bot():
     if not API_KEY or not API_SECRET:
@@ -161,13 +167,12 @@ def run_bot():
     init_db()
 
     send_telegram(
-        f"🛡️ *تم تفعيل درع الشفافية والخروج الزمني*\n"
-        f"• رصد القيمة الحقيقية (MTM) والخسائر العائمة لحظياً.\n"
-        f"• الخروج الزمني التلقائي: `تسييل المراكز بعد 60 دقيقة إذا كسرت -1.2%`.\n"
-        f"• الهدف: `حماية رأس المال ومنع تجميد السيولة في مسارات هابطة`."
+        f"🛡️ *تم تفعيل درع حماية رأس المال والاتجاه*\n"
+        f"• فلتر البيتكوين: `إيقاف الشراء إذا كان BTC هابطاً على 15m`.\n"
+        f"• الهدف الجديد: `+0.55% Maker Limit (~+0.45$ صافي)`.\n"
+        f"• وقف الخسارة الصارم: `-0.65% كحد أقصى أو 30 دقيقة احتجاز`.\n"
+        f"• فترة التهدئة: `20 دقيقة حظر على العملة بعد إغلاقها`."
     )
-
-    last_equity_report = 0
 
     while True:
         try:
@@ -175,14 +180,14 @@ def run_bot():
             usdt_free = float(bal['free'].get('USDT', 0.0))
             open_trades = fetch_active_trades()
 
-            # 1. مراقبة الأوامر وإدارة الخروج الزمني للمراكز العالقة
+            # 1. متابعة الصفقات المفتوحة وأوامر البيع
             for t in open_trades:
                 sym = t['symbol']
                 sell_id = t['sell_order_id']
                 t_id = t['id']
                 opened_at = t['opened_at']
 
-                # أ. فحص أمر البيع الهدف Limit
+                # أ. فحص ضرب هدف الربح
                 target_hit = False
                 if sell_id:
                     try:
@@ -203,12 +208,16 @@ def run_bot():
                                 conn.commit()
 
                             total_acc = get_cumulative_profit()
+                            sign = "+" if total_acc >= 0 else ""
+                            cooldown_tracker[sym] = time.time()  # تفعيل فترة التهدئة
+
                             send_telegram(
-                                f"🎯 *جني ربح لحظي (#{t_id})*\n"
+                                f"🎯 *جني ربح سكالبينج (#{t_id})*\n"
                                 f"• الزوج: `{sym}`\n"
                                 f"• سعر البيع: `{sold_price:.8g}$`\n"
                                 f"• الربح الصافي: `+{net_profit:.2f} USDT`\n"
-                                f"• إجمالي الأرباح المحققة: `+{total_acc:.2f} USDT`"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"💰 *إجمالي الأرباح المحققة:* `{sign}{total_acc:.2f} USDT`"
                             )
                             target_hit = True
                     except Exception:
@@ -217,71 +226,69 @@ def run_bot():
                 if target_hit:
                     continue
 
-                # ب. تطبيق الخروج الزمني (Time-Based Exit)
+                # ب. تطبيق وقف الخسارة الصارم والخروج الزمني
                 hold_duration = (datetime.now() - opened_at).total_seconds()
-                if hold_duration > MAX_HOLD_SECONDS:
-                    try:
-                        ticker = exchange.fetch_ticker(sym)
-                        cur_price = float(ticker['last'])
-                        loss_pct = (cur_price - t['buy_price']) / t['buy_price']
+                try:
+                    ticker = exchange.fetch_ticker(sym)
+                    cur_price = float(ticker['last'])
+                    loss_pct = (cur_price - t['buy_price']) / t['buy_price']
 
-                        if loss_pct <= -TIME_SL_PERCENT:
-                            # إلغاء أمر البيع المعلق
-                            if sell_id:
-                                try:
-                                    exchange.cancel_order(sell_id, sym)
-                                except Exception:
-                                    pass
-                                time.sleep(0.3)
+                    # شرط الخروج: كسر -0.65% أو مرور 30 دقيقة مع خسارة
+                    if loss_pct <= -TIGHT_SL_PERCENT or (hold_duration > MAX_HOLD_SECONDS and loss_pct < 0):
+                        if sell_id:
+                            try:
+                                exchange.cancel_order(sell_id, sym)
+                            except Exception:
+                                pass
+                            time.sleep(0.3)
 
-                            # بيع المركز بسعر السوق لتحرير الكاش
-                            sell_qty = apply_step_size(sym, t['qty'])
-                            exchange.create_market_sell_order(sym, sell_qty)
-                            actual_loss = (cur_price - t['buy_price']) * sell_qty - (t['cost'] * TAKER_FEE_RATE)
+                        sell_qty = apply_step_size(sym, t['qty'])
+                        exchange.create_market_sell_order(sym, sell_qty)
+                        actual_loss = (cur_price - t['buy_price']) * sell_qty - (t['cost'] * TAKER_FEE_RATE)
 
-                            with get_db_connection() as conn:
-                                with conn.cursor() as cur:
-                                    cur.execute("""
-                                        UPDATE trades 
-                                        SET status = 'CLOSED', sell_price = %s, net_profit_usd = %s, closed_at = CURRENT_TIMESTAMP
-                                        WHERE id = %s;
-                                    """, (cur_price, actual_loss, t_id))
-                                conn.commit()
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("""
+                                    UPDATE trades 
+                                    SET status = 'CLOSED', sell_price = %s, net_profit_usd = %s, closed_at = CURRENT_TIMESTAMP
+                                    WHERE id = %s;
+                                """, (cur_price, actual_loss, t_id))
+                            conn.commit()
 
-                            send_telegram(
-                                f"⏱️ *إغلاق زمني وقائي للمركز (#{t_id})*\n"
-                                f"• الزوج: `{sym}` | مدة الاحتجاز: `{hold_duration/60:.0f} دقيقة`\n"
-                                f"• الخسارة المنفذة: `{actual_loss:.2f} USDT` ({loss_pct*100:.2f}%)\n"
-                                f"• تم تحرير السيولة لإعادة التدوير."
-                            )
-                    except Exception as err:
-                        print(f"خطأ الخروج الزمني: {err}")
+                        total_acc = get_cumulative_profit()
+                        sign = "+" if total_acc >= 0 else ""
+                        cooldown_tracker[sym] = time.time()  # حظر الشراء لمدة 20 دقيقة
 
-            # 2. تقرير القيمة الحقيقية للمحفظة دورياً (كل ساعتين)
-            now_ts = time.time()
-            if now_ts - last_equity_report > 7200:
-                net_worth, unrealized = calculate_portfolio_equity(usdt_free, open_trades)
-                send_telegram(
-                    f"📊 *تقرير السيولة والقيمة الحقيقية (MTM)*\n"
-                    f"• رصيد الكاش الحر: `{usdt_free:.2f}$ USDT`\n"
-                    f"• القيمة الإجمالية الفعلية: `{net_worth:.2f}$`\n"
-                    f"• الفارق السعري العائم: `{unrealized:+.2f}$ USDT`\n"
-                    f"• المراكز المفتوحة: `{len(open_trades)}/{MAX_SLOTS}`"
-                )
-                last_equity_report = now_ts
+                        send_telegram(
+                            f"🛑 *قطع خسارة وقائي سريع (#{t_id})*\n"
+                            f"• الزوج: `{sym}` | الاحتجاز: `{hold_duration/60:.0f} دقيقة`\n"
+                            f"• الخسارة: `{actual_loss:.2f} USDT` ({loss_pct*100:.2f}%)\n"
+                            f"• تم تفعيل التهدئة للزوج لمنع الانزلاق المتكرر.\n"
+                            f"• الرصيد التراكمي: `{sign}{total_acc:.2f} USDT`"
+                        )
+                except Exception as err:
+                    print(f"خطأ الخروج الصارم: {err}")
 
-            # 3. فحص فرص الشراء الجديدة بحجم 100$
+            # 2. فحص الدخول في فرص جديدة مع حظر هبوط BTC
             open_trades = fetch_active_trades()
             active_symbols = set(t['symbol'] for t in open_trades)
 
             if len(open_trades) < MAX_SLOTS and usdt_free >= FIXED_TRADE_USD:
+                # التحقق أولاً من اتجاه البيتكوين
+                if not is_btc_trend_bullish():
+                    time.sleep(10)
+                    continue
+
                 for symbol in WATCHLIST:
                     base = symbol.split('/')[0]
 
                     if symbol in active_symbols:
                         continue
 
-                    # فحص عدم وجود رصيد متبقٍ غير مسجل
+                    # فحص فترة التهدئة (Cooldown)
+                    if time.time() - cooldown_tracker.get(symbol, 0) < COOLDOWN_SECONDS:
+                        continue
+
                     base_balance = float(bal['total'].get(base, 0.0))
                     ticker = exchange.fetch_ticker(symbol)
                     cur_price = float(ticker['last'])
@@ -294,16 +301,16 @@ def run_bot():
                     if not lower_band:
                         continue
 
-                    # شرط الدخول: شمعة الدقيقة كسرت الحد السفلي
+                    # شرط كسر الحد السفلي للبولنجر
                     if cur_close <= lower_band:
                         amount_to_buy = apply_step_size(symbol, FIXED_TRADE_USD / cur_close)
                         active_symbols.add(symbol)
 
-                        # تنفيذ الشراء
                         buy_order = exchange.create_market_buy_order(symbol, amount_to_buy)
                         entry_price = float(buy_order.get('average') or cur_close)
                         actual_cost = entry_price * amount_to_buy
 
+                        # أمر بيع Limit بهدف +0.55%
                         sell_target_price = entry_price * (1 + TP_PERCENT)
                         sell_target_price = float(exchange.price_to_precision(symbol, sell_target_price))
 
@@ -324,19 +331,18 @@ def run_bot():
                             conn.commit()
 
                         send_telegram(
-                            f"🟢 *صفقة جديدة (#{t_new_id})*\n"
+                            f"🟢 *صفقة جديدة بالاتجاه الصاعد (#{t_new_id})*\n"
                             f"• الزوج: `{symbol}`\n"
                             f"• سعر الدخول: `{entry_price:.8g}$`\n"
-                            f"• أمر البيع المعلق (Limit): `{sell_target_price:.8g}$` (+0.35%)\n"
-                            f"• الحجم: `{actual_cost:.2f}$ (ثابتة)`\n"
-                            f"• الحماية: `تسييل زمني تلقائي بعد 60 دقيقة`"
+                            f"• أمر البيع (Limit): `{sell_target_price:.8g}$` (+0.55%)\n"
+                            f"• القيمة: `{actual_cost:.2f}$` | حماية BTC: `نشطة`"
                         )
                         break
 
             time.sleep(4)
 
         except Exception as loop_err:
-            print(f"خطأ دورة المحرك: {loop_err}")
+            print(f"خطأ الدورة: {loop_err}")
             time.sleep(6)
 
 if __name__ == "__main__":
