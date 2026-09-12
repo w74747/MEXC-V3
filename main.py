@@ -14,18 +14,19 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DB_URL = os.getenv("DATABASE_URL", "").strip()
 
-# متغيرات التداول الديناميكية (قابلة للتعديل من لوحة تحكم Railway مباشرة)
+# متغيرات التداول الديناميكية
 MAX_SLOTS = int(os.getenv("MAX_SLOTS", "4"))
 FIXED_TRADE_USD = float(os.getenv("FIXED_TRADE_USD", "100.0"))
 MAX_TOTAL_CAPITAL = float(os.getenv("MAX_TOTAL_CAPITAL", "400.0"))
 
-# ثوابت إدارة المخاطر والخروج
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.0055"))          # هدف الربح +0.55%
-TIGHT_SL_PERCENT = float(os.getenv("TIGHT_SL_PERCENT", "0.0065"))  # وقف خسارة -0.65%
-MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", "1800"))   # مدة الاحتجاز (30 دقيقة)
-TAKER_FEE_RATE = 0.001                                         # عمولة Taker (0.1%)
-COOLDOWN_SECONDS = 1200                                        # فترة التهدئة (20 دقيقة)
-BOLLINGER_STD = 1.6                                            # حساسية البولنجر (1m)
+# ثوابت إدارة المخاطر والأهداف المحدثة
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.0042"))              # خفض الهدف إلى +0.42% لسرعة الإغلاق
+TIGHT_SL_PERCENT = float(os.getenv("TIGHT_SL_PERCENT", "0.0065"))  # وقف الخسارة الصارم السريع (-0.65%)
+MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", "3600"))     # تمديد المهلة إلى 60 دقيقة
+TIME_SL_TRIGGER = float(os.getenv("TIME_SL_TRIGGER", "0.0025"))    # لا يغلق زمنياً إلا إذا كانت الخسارة أسوأ من -0.25%
+TAKER_FEE_RATE = 0.001                                             # عمولة الدخول Taker (0.1%)
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1200"))      # فترة التهدئة (20 دقيقة)
+BOLLINGER_STD = 1.6                                                # حساسية البولنجر (1m)
 
 WATCHLIST = [
     'SOL/USDT', 'ETH/USDT', 'DOGE/USDT', 'NEAR/USDT', 
@@ -165,12 +166,12 @@ def run_bot():
     init_db()
 
     send_telegram(
-        f"⚙️ *تم بدء التشغيل بالإعدادات الديناميكية (Railway)*\n"
-        f"• سقف رأس المال المخصص: `{MAX_TOTAL_CAPITAL}$ USDT`\n"
-        f"• السعة القصوى: `{MAX_SLOTS} مراكز متزامنة`\n"
-        f"• حجم الصفقة الواحدة: `{FIXED_TRADE_USD}$ ثابتة`\n"
-        f"• هدف الخروج: `+{TP_PERCENT*100:.2f}% Maker Limit`\n"
-        f"• وقف الخسارة: `-{TIGHT_SL_PERCENT*100:.2f}% أو {MAX_HOLD_SECONDS//60} دقيقة`"
+        f"🎯 *تم تفعيل التحديث الدقيق (Finishing Touch)*\n"
+        f"• هدف الخروج المحدث: `+{TP_PERCENT*100:.2f}% Maker Limit`\n"
+        f"• مهلة التنفس الزمني: `{MAX_HOLD_SECONDS//60} دقيقة`\n"
+        f"• حد التسييل الزمني: `فقط إذا كانت الخسارة أسوأ من -{TIME_SL_TRIGGER*100:.2f}%`\n"
+        f"• وقف الخسارة الصارم: `-{TIGHT_SL_PERCENT*100:.2f}%`\n"
+        f"• السقف المخصص: `{MAX_TOTAL_CAPITAL}$` ({MAX_SLOTS} مراكز × {FIXED_TRADE_USD}$)"
     )
 
     while True:
@@ -179,7 +180,7 @@ def run_bot():
             usdt_free = float(bal['free'].get('USDT', 0.0))
             open_trades = fetch_active_trades()
 
-            # 1. متابعة الصفقات المفتوحة وإدارتها
+            # 1. متابعة الصفقات المفتوحة
             for t in open_trades:
                 sym = t['symbol']
                 sell_id = t['sell_order_id']
@@ -224,7 +225,7 @@ def run_bot():
                 if target_hit:
                     continue
 
-                # وقف الخسارة الصارم أو الزمني (مع حماية ضد الصفر)
+                # وقف الخسارة الصارم أو الزمني المشروط
                 hold_duration = (datetime.now() - opened_at).total_seconds()
                 try:
                     if t['buy_price'] <= 0:
@@ -234,7 +235,13 @@ def run_bot():
                     cur_price = float(ticker['last'])
                     loss_pct = (cur_price - t['buy_price']) / t['buy_price']
 
-                    if loss_pct <= -TIGHT_SL_PERCENT or (hold_duration > MAX_HOLD_SECONDS and loss_pct < 0):
+                    # الشرط الجديد: وقف صارم (-0.65%) أو انتهاء المهلة مع خسارة واضحة (أسوأ من -0.25%)
+                    should_exit_loss = (
+                        loss_pct <= -TIGHT_SL_PERCENT or 
+                        (hold_duration > MAX_HOLD_SECONDS and loss_pct <= -TIME_SL_TRIGGER)
+                    )
+
+                    if should_exit_loss:
                         if sell_id:
                             try:
                                 exchange.cancel_order(sell_id, sym)
@@ -267,9 +274,9 @@ def run_bot():
                             f"• الرصيد التراكمي: `{sign}{total_acc:.2f} USDT`"
                         )
                 except Exception as err:
-                    print(f"خطأ الخروج الصارم: {err}")
+                    print(f"خطأ الخروج المشروط: {err}")
 
-            # 2. فحص الدخول في صفقات جديدة مع تطبيق سقف رأس المال
+            # 2. فحص الدخول في صفقات جديدة
             open_trades = fetch_active_trades()
             active_symbols = set(t['symbol'] for t in open_trades)
             current_allocated_capital = sum(t['cost'] for t in open_trades)
